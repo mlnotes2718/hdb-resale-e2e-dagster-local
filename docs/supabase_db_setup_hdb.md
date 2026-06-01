@@ -14,94 +14,136 @@
 - Alternatively you can get data from [https://data.gov.sg/](https://data.gov.sg/) at
 - https://data.gov.sg/datasets?query=HDB+resale&resultId=d_8b84c4ee58e3cfc0ece0d773c8ca6abc
 
+### Split Data File
+- Next, we need to split the data file into multiple parts to simulate data ingestion in multiple time frame.
+- Use the python script `/data/split_data.py` by opening the terminal.
+- Run the following command:
+
+```bash
+cd data
+```
+
+```bash
+python split_data.py
+```
+
+Under the data folder we should have a subfolder with multiple file split.
+
+![alt text](../assets/data_split_result.PNG)
+
+## Create and Setup Table
+
+### Setup the table
+Go to **SQL Editor**
+
+![alt text](../assets/supa1_sql_editor.PNG)
+
+Paste the following code into one of the new query:
+
+```sql
+-- 1. Completely drop the table (this removes all old rules/triggers automatically)
+DROP TABLE IF EXISTS hdb_resale_flat_prices_e2e;
+
+-- 2. Recreate the table schema
+CREATE TABLE hdb_resale_flat_prices_e2e (
+    id BIGINT PRIMARY KEY,
+    -- Add your actual HDB columns here, for example:
+    month TEXT,
+    town TEXT,
+    flat_type TEXT,
+    block TEXT,
+    street_name TEXT,
+    storey_range TEXT,
+    floor_area_sqm TEXT,
+    flat_model TEXT,
+    lease_commence_date INT,
+    remaining_lease TEXT,
+    resale_price TEXT,
+    -- Keep your core tracking columns with default values
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT clock_timestamp(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT clock_timestamp()
+);
+```
+![alt text](../assets/supa1a_setup_script.PNG)
+
+Click **Run**
+
+![alt text](../assets/supa2_run_create_table.PNG)
+
+Click  **Run and Enable RLS**
+
+### Setup Trigger to Update Timestamp
+
+Paste the following to create trigger function to update timestamp:
+```sql
+-- 1. Create or update the smart trigger function
+CREATE OR REPLACE FUNCTION strict_timestamp_tracker()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF (TG_OP = 'INSERT') THEN
+        IF NEW.created_at IS NULL THEN NEW.created_at = clock_timestamp(); END IF;
+        IF NEW.updated_at IS NULL THEN NEW.updated_at = clock_timestamp(); END IF;
+        
+    ELSIF (TG_OP = 'UPDATE') THEN
+        -- Allow backfills during rule processing if created_at starts as NULL
+        IF OLD.created_at IS NOT NULL THEN
+            NEW.created_at = OLD.created_at;
+        END IF;
+        NEW.updated_at = clock_timestamp();
+    END IF;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 2. Attach the trigger to the fresh table
+CREATE TRIGGER enforce_strict_timestamps
+BEFORE INSERT OR UPDATE ON hdb_resale_flat_prices_e2e
+FOR EACH ROW
+EXECUTE FUNCTION strict_timestamp_tracker();
+
+-- 3. Attach the UI rewrite rule to handle dashboard imports
+CREATE OR REPLACE RULE handle_supabase_ui_csv_inserts AS
+ON INSERT TO hdb_resale_flat_prices_e2e
+DO ALSO (
+    UPDATE hdb_resale_flat_prices_e2e
+    SET 
+        created_at = COALESCE(created_at, clock_timestamp()),
+        updated_at = COALESCE(updated_at, clock_timestamp())
+    WHERE id = NEW.id 
+      AND (created_at IS NULL OR updated_at IS NULL)
+);
+```
+
+> **We only need to run this trigger once.**
+
 ## Importing CSV to Supabase
-- Create a table under table editor but do not enter anything yet.
+- Go to **Table Editor**
 
-![alt text](../assets/supa1_new_table.PNG)
+![alt text](../assets/supa3_go_table_editor.PNG)
 
-- Enter the table name as shown: `hdb_resale_flat_prices_e2e`
+- Select the table `hdb_resale_flat_prices_e2e`
 
-![alt text](../assets/supa2_table_name.PNG)
+![alt text](../assets/supa4_import_csv.PNG)
 
-- Click `Import Data from CSV`
+- Click **Import CSV**
 
-![alt text](../assets/supa3_import_data.PNG)
+![alt text](../assets/supa5_browse_data.PNG)
 
-- Click `browse` (some classmate got issue with drag and drop)
+- Click **Browse** (some classmate got issue with drag and drop)
 
-![alt text](../assets/supa4_browse.PNG)
+- Select the **first split data file (200k)** in the split folder or the subsequent batch if you already done the first batch.
 
-- Once your file is loaded, you should see something like below, click `Save` to import:
+![alt text](../assets/supa6_import.PNG)
 
-![alt text](../assets/supa5_save_import.PNG)
-
-- Click `Save` again
-
-![alt text](../assets/supa6_save_again.PNG)
-
+- Click **Import** to import:
 
 - You should see the import progress as shown below, this will take a while:
 
 ![alt text](../assets/supa7_import_progress.PNG)
 
-### Create primary key
+> Please repeat the above import for subsequent batch
 
-Primary key has been created if you use the split data in the subfolder `split`.
-
-If you upload the original csv, you need to create the primary key as shown below:
-
-Primary key has been created in the data split program.
-
-- Once it is done, we need to add primary key, click insert and select columns
-
-![alt text](../assets/supa8_insert_column.PNG)
-
-- Set the id, type and identity
-
-![alt text](../assets/supa9_id_type.PNG)
-
-- Follow the checks below and click save:
-
-![alt text](../assets/supa10_save_id.PNG)
-
-- We should have the result below:
-
-![alt text](../assets/supa11_result.PNG)
-
-### Setting up Timestamp Tracking
-
-Please only run the following SQl script ONCE:
-
-```sql
--- 1. Add the missing tracking columns to your existing table safely
-ALTER TABLE hdb_resale_flat_prices_e2e 
-ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
-
--- 2. Create the strict timestamp tracking function
-CREATE OR REPLACE FUNCTION strict_timestamp_tracker()
-RETURNS TRIGGER AS $$
-BEGIN
-    -- If a row is being updated, force created_at to stay exactly what it was
-    IF (TG_OP = 'UPDATE') THEN
-        NEW.created_at = OLD.created_at;
-    END IF;
-    
-    -- Force updated_at to refresh to the exact current time
-    NEW.updated_at = NOW();
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
--- 3. Drop the trigger if it already exists (prevents duplication errors)
-DROP TRIGGER IF EXISTS enforce_strict_timestamps ON hdb_resale_flat_prices_e2e;
-
--- 4. Attach the trigger to your existing table
-CREATE TRIGGER enforce_strict_timestamps
-BEFORE UPDATE ON hdb_resale_flat_prices_e2e
-FOR EACH ROW
-EXECUTE FUNCTION strict_timestamp_tracker();
-```
 
 ## Connection with Supabase
 To get the connection setting from Supabase, please follow the steps below:

@@ -117,6 +117,14 @@ Set the following options:
 - `method`: `batch_job`
 - `project`: *your_gcp_project_id*
 
+### Temporary Work Around for Meltano Packaging Issue
+On February 6, 2026, `setuptools` released version 81.0.0, which officially removed the module `pkg_resources` entirely which meltano depends on. The work around fix is as follows:
+1. Open `meltano.yml` under the project folder `meltano-ingestion`.
+2. Under `name: target-bigquery`, look for `pip_url: git+https://github.com/z3z1ma/target-bigquery.git`
+3. Add `setuptools<80` with a space after git. The resulting setup as as follows:
+
+![alt text](../assets/meltano_fix.png)
+
 ### Setting Environment
 
 Comment out the original
@@ -172,6 +180,28 @@ meltano --environment=dev run tap-postgres target-bigquery
 
 You will see the logs printed out in your console. Once the pipeline is completed, you can check the data in BigQuery.
 
+At Bigquery, we can run the following SQL to check the number of record according to timestamp
+
+```sql
+SELECT
+  TIMESTAMP_BUCKET(updated_at, INTERVAL 20 MINUTE)
+    AS updated_at_20_min_interval,
+  COUNT(*) AS record_count
+FROM
+  `sctp-dsai-ds3f-ds5.dev_postgres_hdb_resale_raw.public_hdb_resale_flat_prices_e2e`
+GROUP BY 1
+ORDER BY 1;
+```
+For per minute, use the following:
+```sql
+SELECT
+  TIMESTAMP_TRUNC(updated_at, MINUTE) AS updated_at_minute,
+  COUNT(*) AS record_count
+FROM
+  `sctp-dsai-ds3f-ds5.dev_postgres_hdb_resale_raw.public_hdb_resale_flat_prices_e2e`
+GROUP BY 1
+ORDER BY 1;
+```
 
 ### Manage Incremental State (Timestamp-Based)
 
@@ -181,6 +211,9 @@ Now that incremental replication is configured using `updated_at` as the replica
 
 ```bash
 meltano --environment=dev state list
+```
+
+```bash
 meltano --environment=dev state get dev:tap-postgres-to-target-bigquery
 ```
 
@@ -352,7 +385,7 @@ models:
 ```sql
 {{ config(materialized='view') }}
 
-WITH RAW AS (
+WITH raw_source AS (
     SELECT
         id,
         PARSE_DATE('%Y-%m', month) AS resale_month,
@@ -365,18 +398,48 @@ WITH RAW AS (
         flat_model,
         lease_commence_date,
         remaining_lease,
-            -- Extract years, default to 0 if not found, multiply by 12
-            COALESCE(CAST(REGEXP_EXTRACT(remaining_lease, r'(\d+) year') AS INT64), 0) * 12 +
-            -- Extract months, default to 0 if not found
-            COALESCE(CAST(REGEXP_EXTRACT(remaining_lease, r'(\d+) month') AS INT64), 0) 
+        -- Extract years, default to 0 if not found, multiply by 12
+        COALESCE(CAST(REGEXP_EXTRACT(remaining_lease, r'(\d+) year') AS INT64), 0) * 12 +
+        -- Extract months, default to 0 if not found
+        COALESCE(CAST(REGEXP_EXTRACT(remaining_lease, r'(\d+) month') AS INT64), 0) 
         AS remaining_lease_months,
-        CAST(resale_price AS FLOAT64) AS resale_price
-    FROM {{ source('hdb_resale_source', 'public_resale_flat_prices_from_jan_2017') }}
+        CAST(resale_price AS FLOAT64) AS resale_price,
+        -- Keep your timestamp column to identify the freshest record
+        updated_at
+    -- Changed to underscore to avoid BigQuery compilation bugs
+    FROM {{ source('hdb_resale_source', 'public_hdb_resale_flat_prices_e2e') }}
+),
+
+deduplicated AS (
+    SELECT 
+        *,
+        -- Assigns 1 to the most recent record per individual ID
+        ROW_NUMBER() OVER (
+            PARTITION BY id 
+            ORDER BY updated_at DESC
+        ) AS row_num
+    FROM raw_source
 )
+
 SELECT
-    *,
+    id,
+    resale_month,
+    town,
+    flat_type,
+    block,
+    street_name,
+    storey_range,
+    floor_area_sqm,
+    flat_model,
+    lease_commence_date,
+    remaining_lease,
+    remaining_lease_months,
+    resale_price,
     resale_price / floor_area_sqm AS price_per_sqm
-FROM raw
+FROM deduplicated
+-- Filters out any duplicate records pulled by your replication tool
+WHERE row_num = 1
+
 ```
 
 > 4. Under `/models/staging`, create  `stg_hdb_resale.yml` which contains the source and the schema.
@@ -389,7 +452,7 @@ sources:
     description: "Raw HDB resale data from Postgres source"
     schema: "{{ target.name }}_postgres_hdb_resale_raw"
     tables:
-      - name: public_resale_flat_prices_from_jan_2017
+      - name: public_hdb_resale_flat_prices_e2e
         description: "Raw monthly HDB transaction records"
 
 models:
@@ -624,7 +687,7 @@ sources:
       dagster:
         asset_key: ["pipeline_meltano"]
     tables:
-      - name: public_resale_flat_prices_from_jan_2017
+      - name: public_hdb_resale_flat_prices_e2e
         description: "Raw monthly HDB transaction records"
 ```
 
